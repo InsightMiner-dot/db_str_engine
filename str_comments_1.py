@@ -1,4 +1,5 @@
 import os
+import asyncio
 import pandas as pd
 from typing import List, Optional
 from pydantic import Field, create_model
@@ -10,7 +11,7 @@ from langchain_core.prompts import ChatPromptTemplate
 load_dotenv(override=True)
 
 # ==========================================
-# 1. DYNAMIC SCHEMA GENERATOR
+# 1. DYNAMIC SCHEMA GENERATOR (Stays Sync)
 # ==========================================
 def build_dynamic_schema(target_columns: list, mapping_df: pd.DataFrame):
     fields = {}
@@ -19,7 +20,6 @@ def build_dynamic_schema(target_columns: list, mapping_df: pd.DataFrame):
     for col in target_columns:
         safe_name = col.strip().lower().replace(" ", "_").replace("/", "_").replace("-", "_")
         
-        # Enforce strict mapping if the column exists in the mapping file
         if col.strip().lower() in mapping_cols_lower:
             original_map_col = mapping_cols_lower[col.strip().lower()]
             desc = f"Map strictly to one of the exact allowed values for '{original_map_col}'."
@@ -37,35 +37,100 @@ def build_dynamic_schema(target_columns: list, mapping_df: pd.DataFrame):
     return DynamicPayloadModel, list(fields.keys())
 
 # ==========================================
-# 2. RUNTIME EXTRACTION PIPELINE
+# 2. ASYNC WORKER FUNCTION (Processes 1 row)
 # ==========================================
-def process_dynamic_comments(input_file: str, mapping_file: str, output_file: str):
+async def async_process_single_row(
+    idx, raw_comment, base_row_data, target_columns, pydantic_field_names, 
+    allowed_values_context, parsing_chain, semaphore
+):
+    """Processes a single row asynchronously, protected by a concurrency semaphore."""
+    async with semaphore:
+        extracted_rows = []
+        
+        try:
+            # Use ainvoke() for asynchronous execution
+            response = await parsing_chain.ainvoke({
+                "allowed_values_context": allowed_values_context,
+                "comment": str(raw_comment)
+            })
+            
+            if response and response.items:
+                for item in response.items:
+                    row_dict = item.model_dump()
+                    final_row = base_row_data.copy()
+                    
+                    for original_col, safe_key in zip(target_columns, pydantic_field_names):
+                        final_row[original_col] = row_dict[safe_key]
+                        
+                    # --- OH/LC FALLBACK LOGIC ---
+                    oh_lc_col = next((c for c in target_columns if 'oh' in str(c).lower() and 'lc' in str(c).lower()), None)
+                    costcat_col = next((c for c in target_columns if 'costcat' in str(c).lower() or 'cost cat' in str(c).lower()), None)
+                    
+                    if oh_lc_col and costcat_col:
+                        current_oh_lc = final_row.get(oh_lc_col)
+                        
+                        if pd.isna(current_oh_lc) or str(current_oh_lc).strip() == "" or str(current_oh_lc).lower() == "none":
+                            cost_cat_val = str(final_row.get(costcat_col, "")).strip().upper()
+                            
+                            lc_categories = ["FSA COSTS", "PERSONAL COSTS", "CONTRACTORS"]
+                            oh_categories = [
+                                "PROCURED SERVICES", "TRAVEL & MEALS", "EMPLOYEE WELFARE", 
+                                "OPERATING COSTST", "OPERATING COSTS", "EMPLOYEE ACTIVITY COST", 
+                                "RECHARGE", "OFFICE SPACE", "COMPANY CAR COSTS", 
+                                "RECHARGE OUTSIDFE", "RECHARGE OUTSIDE", "TAX", 
+                                "PROVISION DEBT", "DEPRECIATION", "FUNCTIONAL TASK"
+                            ]
+                            
+                            if any(lc_item in cost_cat_val for lc_item in lc_categories):
+                                final_row[oh_lc_col] = "LC"
+                            elif any(oh_item in cost_cat_val for oh_item in oh_categories):
+                                final_row[oh_lc_col] = "OH"
+                    # --- END OH/LC FALLBACK LOGIC ---
+                        
+                    extracted_rows.append(final_row)
+            else:
+                fallback_row = base_row_data.copy()
+                for col in target_columns:
+                    fallback_row[col] = None
+                extracted_rows.append(fallback_row)
+                
+        except Exception as e:
+            print(f" [ALERT] Failed on row {idx}: {e}")
+            error_row = base_row_data.copy()
+            for col in target_columns:
+                error_row[col] = None
+                
+            context_col_match = [c for c in target_columns if 'context' in c.lower() or 'driver' in c.lower()]
+            if context_col_match:
+                error_row[context_col_match[0]] = f"SYSTEM ERROR: {str(e)}"
+                
+            extracted_rows.append(error_row)
+            
+        return extracted_rows
+
+# ==========================================
+# 3. MAIN ASYNC ORCHESTRATOR
+# ==========================================
+async def process_dynamic_comments_async(input_file: str, mapping_file: str, output_file: str, max_concurrency: int = 10):
     print("Loading source files...")
     
     mapping_df = pd.read_excel(mapping_file)
     input_df = pd.read_excel(input_file)
     
-    # Dynamically locate the 'Comments' column
     comment_col = [c for c in input_df.columns if 'omment' in c.lower()][0] 
     comment_idx = input_df.columns.get_loc(comment_col)
     
-    # Split the columns based on your schema layout:
-    # Base columns (File_name, Category, etc.) are everything up to and including 'Comments'
     base_columns = input_df.columns[:comment_idx + 1].tolist()
-    
-    # Target columns (Region, Market, OH_LC, etc.) are everything after 'Comments'
     target_columns = input_df.columns[comment_idx + 1:].tolist()
     
     print("Generating schema from blank target columns...")
     DynamicPayloadSchema, pydantic_field_names = build_dynamic_schema(target_columns, mapping_df)
     
-    # Build a dictionary of allowed values for the Prompt
     allowed_values_context = ""
     for col in mapping_df.columns:
         unique_vals = [str(x) for x in mapping_df[col].dropna().unique()]
         allowed_values_context += f"- {col}: {', '.join(unique_vals)}\n"
 
-    # Load Azure config
     azure_endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     azure_api_key = os.getenv("AZURE_OPENAI_KEY")
     azure_deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
@@ -96,80 +161,60 @@ def process_dynamic_comments(input_file: str, mapping_file: str, output_file: st
             "--- SHORTHAND TRANSLATION ---\n"
             "- 'o/w' = 'of which'. Split nested elements out into their own individual rows!\n"
             "- 'M' = Millions (e.g., '-7M').\n"
+            "- 'OH' = Over Head Cost, 'LC' = Labour Cost.\n"
         )),
         ("user", "Parse this variance comment text into structured rows:\n\n{comment}")
     ])
 
     parsing_chain = prompt_template | structured_llm
 
-    all_structured_rows = []
+    # Setup Async Semaphore (controls how many API calls happen at the exact same time)
+    semaphore = asyncio.Semaphore(max_concurrency)
+    tasks = []
 
-    print(f"Executing extraction across {len(input_df)} rows...")
+    print(f"Queueing {len(input_df)} rows for concurrent extraction...")
     for idx, row in input_df.iterrows():
         raw_comment = row[comment_col]
         
-        # Skip if there is no comment to parse
         if pd.isna(raw_comment) or str(raw_comment).strip() == "":
             continue
             
-        # 1. Capture the base metadata (File_name, Category, Scenarios, Year, Month, Comments)
         base_row_data = {col: row[col] for col in base_columns}
-            
-        try:
-            # 2. Ask LLM to extract just the target columns
-            response = parsing_chain.invoke({
-                "allowed_values_context": allowed_values_context,
-                "comment": str(raw_comment)
-            })
-            
-            if response and response.items:
-                # 3. For every item the LLM found, duplicate the base data and append the LLM data
-                for item in response.items:
-                    row_dict = item.model_dump()
-                    
-                    # Start with a fresh copy of the base metadata
-                    final_row = base_row_data.copy()
-                    
-                    # Map the LLM's target columns back to the exact input file headers
-                    for original_col, safe_key in zip(target_columns, pydantic_field_names):
-                        final_row[original_col] = row_dict[safe_key]
-                        
-                    all_structured_rows.append(final_row)
-            else:
-                # Fallback if no items extracted
-                fallback_row = base_row_data.copy()
-                for col in target_columns:
-                    fallback_row[col] = None
-                all_structured_rows.append(fallback_row)
-                    
-        except Exception as e:
-            print(f" [ALERT] Failed on row {idx}: {e}")
-            error_row = base_row_data.copy()
-            for col in target_columns:
-                error_row[col] = None
-                
-            # Log error in the context column if it exists
-            context_col_match = [c for c in target_columns if 'context' in c.lower() or 'driver' in c.lower()]
-            if context_col_match:
-                error_row[context_col_match[0]] = f"SYSTEM ERROR: {str(e)}"
-                
-            all_structured_rows.append(error_row)
+        
+        # Create an async task for this row and add it to our list
+        task = async_process_single_row(
+            idx, raw_comment, base_row_data, target_columns, pydantic_field_names, 
+            allowed_values_context, parsing_chain, semaphore
+        )
+        tasks.append(task)
+
+    # Execute all queued tasks concurrently
+    print(f"Executing API calls with a concurrency limit of {max_concurrency}...")
+    results = await asyncio.gather(*tasks)
+    
+    # Results is a list of lists (since one row can return multiple extracted items). Flatten it:
+    all_structured_rows = [item for sublist in results for item in sublist]
 
     # ==========================================
     # 3. BUILD DATAFRAME & EXPORT
     # ==========================================
     output_df = pd.DataFrame(all_structured_rows)
-    
-    # Ensure columns match the exact order of the original input file
     output_df = output_df[input_df.columns]
     
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     output_df.to_excel(output_file, index=False)
-    print(f"\nSuccess! Structured file written to: {output_file}")
+    print(f"\nSuccess! Async pipeline complete. Structured file written to: {output_file}")
 
+# ==========================================
+# 4. ENTRY POINT
+# ==========================================
 if __name__ == "__main__":
-    process_dynamic_comments(
-        input_file="data/input_comments.xlsx",
-        mapping_file="data/mapping_file.xlsx",
-        output_file="data/structured_variance_output.xlsx"
+    # We use asyncio.run() to trigger the async main function
+    asyncio.run(
+        process_dynamic_comments_async(
+            input_file="data/input_comments.xlsx",
+            mapping_file="data/mapping_file.xlsx",
+            output_file="data/structured_variance_output.xlsx",
+            max_concurrency=10  # Increase to 15 or 20 if your Azure Quota allows it!
+        )
     )
